@@ -5,3 +5,17 @@ html, body {
 canvas {
   display: block;
 }
+
+#controls {
+  position: absolute;
+  left: 500px;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: center;
+  font: 12px sans-serif;
+}
+#controls button { padding: 3px 10px; }
+#controls div { display: inline-flex; align-items: center; gap: 4px; }

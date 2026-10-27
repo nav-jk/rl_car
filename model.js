@@ -3,6 +3,32 @@
 
 const tf = typeof window !== 'undefined' ? window.tf : require('@tensorflow/tfjs');
 
+// ---------- (de)serialisation helpers ----------
+// Tensors are stored as base64 of their raw bytes, so a save file is lossless and reasonably compact.
+function bytesToB64(u8) {
+  let bin = '';
+  for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+function f32ToB64(f32) { return bytesToB64(new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength)); }
+function b64ToF32(b64) { const u8 = b64ToBytes(b64); return new Float32Array(u8.buffer, u8.byteOffset, u8.byteLength / 4); }
+
+function tensorToObj(t) {
+  const d = t.dataSync();   // Float32Array or Int32Array
+  return { dtype: t.dtype, shape: t.shape, data: bytesToB64(new Uint8Array(d.buffer, d.byteOffset, d.byteLength)) };
+}
+function objToTensor(o) {
+  const u8 = b64ToBytes(o.data);
+  const arr = o.dtype === 'int32' ? new Int32Array(u8.buffer) : new Float32Array(u8.buffer);
+  return tf.tensor(arr, o.shape, o.dtype);
+}
+
 // ---------- Replay buffer ----------
 class ReplayBuffer {
   constructor(capacity = 100000) {
@@ -17,6 +43,35 @@ class ReplayBuffer {
     this.idx = (this.idx + 1) % this.capacity;
   }
   get size() { return this.data.length; }
+
+  // Flat Float32 rows: [s..., a..., r, s2..., d]  (storage order and write pointer are kept)
+  exportState(stateDim, actionDim) {
+    const w = stateDim * 2 + actionDim + 2, n = this.data.length;
+    const out = new Float32Array(n * w);
+    for (let i = 0; i < n; i++) {
+      const it = this.data[i];
+      out.set([...it.s, ...it.a, it.r, ...it.s2, it.d], i * w);
+    }
+    return { n, idx: this.idx, width: w, data: f32ToB64(out) };
+  }
+  importState(o, stateDim, actionDim) {
+    const w = stateDim * 2 + actionDim + 2;
+    if (o.width !== w) throw new Error('replay buffer row width mismatch');
+    const f = b64ToF32(o.data);
+    this.data = [];
+    for (let i = 0; i < o.n; i++) {
+      const r = Array.from(f.subarray(i * w, (i + 1) * w));
+      this.data.push({
+        s: r.slice(0, stateDim),
+        a: r.slice(stateDim, stateDim + actionDim),
+        r: r[stateDim + actionDim],
+        s2: r.slice(stateDim + actionDim + 1, 2 * stateDim + actionDim + 1),
+        d: r[w - 1],
+      });
+    }
+    this.idx = o.idx % this.capacity;
+  }
+
   sample(n) {
     const b = [];
     for (let i = 0; i < n; i++) b.push(this.data[Math.floor(Math.random() * this.data.length)]);
@@ -75,6 +130,8 @@ class SAC {
     this._half = this.actionLow.map((l, i) => (this.actionHigh[i] - l) / 2);
 
     const hidden = opts.hidden ?? 256;
+    this.hidden = hidden;
+    this.lr = opts.lr ?? 3e-4;
     this.actor = buildActor(stateDim, actionDim, hidden);
     this.q1 = buildCritic(stateDim, actionDim, hidden);
     this.q2 = buildCritic(stateDim, actionDim, hidden);
@@ -200,6 +257,63 @@ class SAC {
       const t = tgt.getWeights();
       tgt.setWeights(s.map((w, i) => w.mul(this.tau).add(t[i].mul(1 - this.tau))));
     });
+  }
+
+  // ---------- full training-state snapshot ----------
+  // Everything needed to resume training exactly: all 5 networks, temperature, Adam moments,
+  // and (optionally, it is the big part) the replay buffer.
+  async exportState({ includeBuffer = true } = {}) {
+    const nets = m => m.getWeights().map(tensorToObj);
+    const opt = async o => (await o.getWeights()).map(w => ({ name: w.name, ...tensorToObj(w.tensor) }));
+    return {
+      format: 'sac-state', version: 1,
+      config: {
+        stateDim: this.stateDim, actionDim: this.actionDim, hidden: this.hidden,
+        gamma: this.gamma, tau: this.tau, batchSize: this.batchSize, lr: this.lr,
+        targetEntropy: this.targetEntropy, actionLow: this.actionLow, actionHigh: this.actionHigh,
+      },
+      weights: {
+        actor: nets(this.actor), q1: nets(this.q1), q2: nets(this.q2),
+        q1T: nets(this.q1T), q2T: nets(this.q2T),
+        logAlpha: this.logAlpha.dataSync()[0],
+      },
+      optimizers: { actor: await opt(this.actorOpt), critic: await opt(this.criticOpt), alpha: await opt(this.alphaOpt) },
+      buffer: includeBuffer ? this.buffer.exportState(this.stateDim, this.actionDim) : null,
+    };
+  }
+
+  // Restores in place (the SAC object, and the arrays the sketch holds, stay valid).
+  // Returns a list of warnings (e.g. optimizer state could not be restored).
+  async importState(st) {
+    if (st.format !== 'sac-state') throw new Error('not a SAC state');
+    const c = st.config, warnings = [];
+    if (c.stateDim !== this.stateDim || c.actionDim !== this.actionDim || c.hidden !== this.hidden)
+      throw new Error(`model shape mismatch: file has state ${c.stateDim}, action ${c.actionDim}, hidden ${c.hidden}; ` +
+        `this agent has state ${this.stateDim}, action ${this.actionDim}, hidden ${this.hidden}`);
+
+    const setNet = (m, arr) => {
+      const ts = arr.map(objToTensor);
+      m.setWeights(ts);
+      ts.forEach(t => t.dispose());
+    };
+    setNet(this.actor, st.weights.actor); setNet(this.q1, st.weights.q1); setNet(this.q2, st.weights.q2);
+    setNet(this.q1T, st.weights.q1T); setNet(this.q2T, st.weights.q2T);
+    this.logAlpha.assign(tf.scalar(st.weights.logAlpha));
+
+    const setOpt = async (o, arr, label) => {
+      try {
+        await o.setWeights(arr.map(w => ({ name: w.name, tensor: objToTensor(w) })));
+      } catch (e) {
+        warnings.push(`${label} optimizer state not restored (${e.message}); Adam moments restart from zero`);
+      }
+    };
+    await setOpt(this.actorOpt, st.optimizers.actor, 'actor');
+    await setOpt(this.criticOpt, st.optimizers.critic, 'critic');
+    await setOpt(this.alphaOpt, st.optimizers.alpha, 'alpha');
+
+    if (st.buffer) this.buffer.importState(st.buffer, this.stateDim, this.actionDim);
+    else { this.buffer.data = []; this.buffer.idx = 0; warnings.push('no replay buffer in file: starting with an empty one'); }
+    return warnings;
   }
 
   async save(name = 'sac-actor') {
