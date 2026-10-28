@@ -7,12 +7,23 @@ let epSteps = 0, epReturn = 0, episode = 0, totalLaps = 0;
 let lastStats = null, lastEpReturn = null, bestEpReturn = -Infinity;
 let history = { epReturn: [], epLen: [], outcome: [] };
 
+// ---- track editor ----
+let editStage = null;                       // null | 'outer' | 'inner' | 'start' | 'heading'
+let draft = { outer: [], inner: [], start: null };
+let editBtns = {};
+const STAGE_HELP = {
+  outer:   'OUTER boundary: click to add points (min 3), then press Next',
+  inner:   'INNER boundary: click to add points (min 3, inside the outer), then press Next',
+  start:   'click the START position (on the track)',
+  heading: 'click again to set the driving DIRECTION from the start point',
+};
+
 const WARMUP = 1000;          // random actions before learning starts
 const MAX_EP_STEPS = 700;    // a full lap is roughly 700-1000 steps, so 600 was too short
 const TRAIN_EVERY = 1;        // one gradient step per N sim steps
 
 // ---- UI state ----
-const PANEL_X = 500;          // the track occupies x < 500, the dashboard lives to its right
+const PANEL_X = 700;          // the track occupies x < 500, the dashboard lives to its right
 let trail, charts, speedSlider, pauseBtn, trailChk, bufferChk, greedyChk, fileInput;
 let statusMsg = '', statusUntil = 0;
 
@@ -28,7 +39,8 @@ function setup() {
     actionHigh: [1, 1],
     hidden: 128,
     batchSize: 64,
-    alphaLr: 1e-5
+    alphaLr: 1e-5,
+    lr: 1e-6
   });
 
   trail = new Trail();
@@ -84,17 +96,124 @@ function buildUI() {
   lbl.parent(box);
   speedSlider = createSlider(1, 20, 1, 1);   // sim steps per drawn frame
   speedSlider.parent(box);
+
+  const editBtn = createButton('Edit track');
+  editBtn.parent(box);
+  editBtn.mousePressed(startEdit);
+
+  const defBtn = createButton('Default track');
+  defBtn.parent(box);
+  defBtn.mousePressed(() => applyTrack(new Track()));
+
+  editBtns.next = createButton('Next');
+  editBtns.undo = createButton('Undo');
+  editBtns.cancel = createButton('Cancel edit');
+  editBtns.next.mousePressed(nextStage);
+  editBtns.undo.mousePressed(undoPoint);
+  editBtns.cancel.mousePressed(cancelEdit);
+  Object.values(editBtns).forEach(b => { b.parent(box); b.hide(); });
+}
+
+function startEdit() {
+  draft = { outer: [], inner: [], start: null };
+  editStage = 'outer';
+  Object.values(editBtns).forEach(b => b.show());
+  setStatus(STAGE_HELP.outer, 600000);
+}
+
+function endEdit() {
+  editStage = null;
+  Object.values(editBtns).forEach(b => b.hide());
+}
+
+function cancelEdit() { endEdit(); setStatus('track edit cancelled'); }
+
+function undoPoint() {
+  if (editStage === 'outer') draft.outer.pop();
+  else if (editStage === 'inner') draft.inner.pop();
+  else if (editStage === 'start' || editStage === 'heading') {
+    draft.start = null; editStage = 'start'; setStatus(STAGE_HELP.start, 600000);
+  }
+}
+
+function nextStage() {
+  if (editStage === 'outer') {
+    if (draft.outer.length < 3) return setStatus('outer needs at least 3 points', 4000);
+    editStage = 'inner';
+  } else if (editStage === 'inner') {
+    if (draft.inner.length < 3) return setStatus('inner needs at least 3 points', 4000);
+    const bad = draft.inner.some(p => !isInside(draft.outer, p[0], p[1]));
+    if (bad) return setStatus('every inner point must lie inside the outer boundary', 6000);
+    editStage = 'start';
+  } else return;
+  setStatus(STAGE_HELP[editStage], 600000);
+}
+
+function mousePressed(e) {
+  if (!editStage) return;
+  if (!e || !e.target || e.target.tagName !== 'CANVAS') return;   // ignore UI clicks
+  if (mouseX < 0 || mouseX >= PANEL_X || mouseY < 0 || mouseY > height) return;
+
+  const p = [Math.round(mouseX), Math.round(mouseY)];
+  if (editStage === 'outer') draft.outer.push(p);
+  else if (editStage === 'inner') draft.inner.push(p);
+  else if (editStage === 'start') {
+    const t = new Track({ outer: draft.outer, inner: draft.inner });
+    if (t.checkLeftTrackLimits([{ x: p[0], y: p[1] }])) {
+      return setStatus('start must be on the track (between inner and outer)', 5000);
+    }
+    draft.start = { x: p[0], y: p[1] };
+    editStage = 'heading';
+    setStatus(STAGE_HELP.heading, 600000);
+  } else if (editStage === 'heading') {
+    const heading = Math.atan2(p[1] - draft.start.y, p[0] - draft.start.x);
+    applyTrack(new Track({ outer: draft.outer, inner: draft.inner, start: draft.start, heading }));
+    endEdit();
+  }
+}
+
+// Swap the track; the learned policy is kept, only the running episode restarts
+function applyTrack(t) {
+  track = t;
+  trail.clear();
+  state = rst();
+  epSteps = 0; epReturn = 0;
+  setStatus('track applied, learning continues');
+}
+
+function drawDraft() {
+  push();
+  noFill(); strokeWeight(2);
+  const poly = (pts, col, close) => {
+    stroke(col);
+    beginShape(); pts.forEach(q => vertex(q[0], q[1])); close ? endShape(CLOSE) : endShape();
+    fill(col); noStroke();
+    pts.forEach(q => circle(q[0], q[1], 7));
+    noFill();
+  };
+  poly(draft.outer, '#dc2626', editStage !== 'outer');
+  poly(draft.inner, '#2563eb', editStage !== 'inner');
+  if (draft.start) { fill('#059669'); noStroke(); circle(draft.start.x, draft.start.y, 10); }
+  if (editStage === 'heading') {
+    stroke('#059669'); line(draft.start.x, draft.start.y, mouseX, mouseY);
+  }
+  pop();
 }
 
 function setStatus(msg, ms = 6000) { statusMsg = msg; statusUntil = millis() + ms; }
 
 // Start a new episode and return the first observation
 function rst() {
-  car = new Car(30, 200);
+  car = new Car(track.start.x, track.start.y);
+  if (track.heading !== null) {
+    // adjust to whatever your Car calls its heading
+    if ('heading' in car) car.heading = track.heading;
+    else if ('angle' in car) car.angle = track.heading;
+  }
   driver = new Driver(car, track);
-  driver.sensorInit();        // only after the track is set
+  driver.sensorInit();
   driver.resetProgress();
-  driver.update();            // one sense pass so the first state is real
+  driver.update();
   return driver.state;
 }
 
@@ -160,12 +279,12 @@ function rlStep() {
 }
 
 function draw() {
-  if (!paused && !busy) {
+  if (!paused && !busy && !editStage) {
     for (let i = 0; i < speedSlider.value(); i++) rlStep();
   }
 
-  background(220);
-  track.show();
+  background(200);
+  if (editStage) { drawDraft(); } else { track.show(); }   // see note below
   if (trailChk.checked()) trail.draw(simTick);
   driver.show();
   car.show();
@@ -270,21 +389,23 @@ async function loadRunFile(file) {
 }
 
 class Track {
-  constructor() {
-    this.outer_pts = [[10, 10], [470, 10], [470, 470], [10, 470]];
-    this.inner_pts = [[70, 70], [70, 400], [400, 400], [400, 70]];
+  constructor(opts = {}) {
+    this.outer_pts = opts.outer ?? [[10, 10], [470, 10], [470, 470], [10, 470]];
+    this.inner_pts = opts.inner ?? [[70, 70], [70, 400], [400, 400], [400, 70]];
+    this.start = opts.start ?? { x: 30, y: 200 };
+    this.heading = opts.heading ?? null;       // null = keep Car's default heading
     this.out_vertices = this.outer_pts.length;
     this.in_vertices = this.inner_pts.length;
 
     this.obstacles = [];
     this.checkpoints = [];
 
-    for (let i = 0; i < this.in_vertices; i++) {
-      this.addStaticObstacle(this.inner_pts[i][0], this.inner_pts[i][1], this.inner_pts[(i + 1) % this.in_vertices][0], this.inner_pts[(i + 1) % this.in_vertices][1]);
-    }
-    for (let i = 0; i < this.out_vertices; i++) {
-      this.addStaticObstacle(this.outer_pts[i][0], this.outer_pts[i][1], this.outer_pts[(i + 1) % this.out_vertices][0], this.outer_pts[(i + 1) % this.out_vertices][1]);
-    }
+    const ring = (pts) => pts.forEach((p, i) => {
+      const q = pts[(i + 1) % pts.length];
+      this.addStaticObstacle(p[0], p[1], q[0], q[1]);
+    });
+    ring(this.inner_pts);
+    ring(this.outer_pts);
   }
   addStaticObstacle(x1, y1, x2, y2) {
     this.obstacles.push({ start: { x: x1, y: y1 }, end: { x: x2, y: y2 } });
